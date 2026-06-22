@@ -1,0 +1,28 @@
+[package]
+name = "mythd-core"
+description = "mythd Layer 1 — security primitives: ML-KEM-768, ML-DSA-65, safetensors loading, zeroizing key material"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Layer 1 has NO dependency on any other mythd crate. It is the trust root;
+# everything above depends on it, never the reverse.
+
+[dependencies]
+ml-kem.workspace = true
+ml-dsa.workspace = true
+signature.workspace = true
+safetensors.workspace = true
+zeroize.workspace = true
+sha2.workspace = true
+hkdf.workspace = true
+chacha20poly1305.workspace = true
+rand_core.workspace = true
+getrandom.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

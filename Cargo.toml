@@ -1,0 +1,72 @@
+[workspace]
+resolver = "2"
+members = [
+    "mythd-core",       # Layer 1: security primitives (PQC, safetensors, zeroize)
+    "mythd-xpu",        # Layer 2: XPU kernel FFI (SYCL BitNet INT2, memory pool, caps)
+    "mythd-inference",  # Layer 3: orchestrator (model load, batching, kernel routing)
+    "mythd-session",    # Layer 4: session manager (isolated KV cache, signed audit log)
+    "mythd-api",        # Layer 5: API surface (Axum, PQ-TLS, OpenAI-compatible)
+    "mythd-bin",        # daemon entry point (mythd)
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/universalbasicinc/mythd"
+authors = ["Universal Basic Inc."]
+
+[workspace.dependencies]
+# Internal crates (path deps; the security layering is enforced by which of
+# these each crate is *allowed* to depend on — see each crate's Cargo.toml).
+mythd-core = { path = "mythd-core", version = "0.1.0" }
+mythd-xpu = { path = "mythd-xpu", version = "0.1.0" }
+mythd-inference = { path = "mythd-inference", version = "0.1.0" }
+mythd-session = { path = "mythd-session", version = "0.1.0" }
+mythd-api = { path = "mythd-api", version = "0.1.0" }
+
+# --- Layer 1 security primitives (pure-Rust, no C/FFI) ---
+ml-kem = { version = "0.3", features = ["zeroize"] }  # FIPS 203 ML-KEM-768
+ml-dsa = "0.1"                 # FIPS 204 ML-DSA-65 (signatures)
+signature = "2"                # Signer/Verifier traits used by ml-dsa
+safetensors = "0.8"            # safe tensor format ONLY — no pickle, ever
+zeroize = { version = "1.9", features = ["derive"] }
+sha2 = "0.11"
+hkdf = "0.13"
+chacha20poly1305 = "0.10"      # XChaCha20-Poly1305 AEAD for app-layer session encryption
+rand_core = "0.10"             # ml-kem/ml-dsa target rand_core 0.10
+getrandom = "0.3"
+
+# --- error handling / utility ---
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# --- config / serialization (no executable deserialization) ---
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+serde_json = "1"
+
+# --- async / API (Layer 5) ---
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync"] }
+axum = { version = "0.8", features = ["ws"] }
+tokio-stream = "0.1"           # SSE streaming for /v1/chat/completions
+base64 = "0.22"               # transport encoding of KEM keys/ciphertext + signatures
+
+# --- Layer 5 post-quantum TLS (optional; gated behind mythd-bin's `pq-tls`) ---
+# rustls-post-quantum adds the X25519MLKEM768 hybrid key exchange to rustls.
+rustls = "0.23"
+rustls-post-quantum = "0.2"
+rustls-pemfile = "2"
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+
+# --- integration test client (dev only) ---
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"      # a security daemon should not unwind through FFI / leak state

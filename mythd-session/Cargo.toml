@@ -1,0 +1,26 @@
+[package]
+name = "mythd-session"
+description = "mythd Layer 4 — session manager: per-session KV cache isolated by Rust ownership, ML-DSA-65 signed audit log, capability model"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Layer 4 depends on Layers 1 and 3.
+[dependencies]
+mythd-core.workspace = true
+mythd-inference.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+base64.workspace = true
+
+[features]
+# Forwards to Layer 3's llama.cpp engine so the live example can run on the XPU.
+llama-cpp = ["mythd-inference/llama-cpp"]
+
+[dev-dependencies]
+tracing-subscriber.workspace = true

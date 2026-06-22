@@ -1,0 +1,26 @@
+[package]
+name = "mythd-xpu"
+description = "mythd Layer 2 — XPU kernel interface: FFI to the SYCL BitNet INT2 kernel, device capability detection, device memory pool"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+build = "build.rs"
+
+# Layer 2 depends only on Layer 1.
+[dependencies]
+mythd-core.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+# Runtime detection of the Level-Zero loader (no link-time dependency on an Intel
+# GPU stack — that is what makes the fallback path work on non-Xe2 hosts).
+libloading = "0.8"
+# IEEE half precision for the BitNet kernel's activation operand.
+half = "2"
+
+[features]
+# OFF by default so the workspace builds without the SYCL kernel object present.
+# When ON, `build.rs` links the compiled BitNet kernel (a C-ABI `bitnet_i2s_dpas`
+# symbol). Provide its location via the env vars documented in build.rs.
+xpu-kernels = []

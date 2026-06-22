@@ -1,0 +1,20 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+
+# Compiled kernel shim (built on the GPU host; see kernels/mythd_llama.cpp)
+kernels/*.so
+kernels/*.o
+
+# Local config / secrets — never commit these
+*.pem
+*.key
+*.crt
+mythd*.toml
+!docs/**/mythd.toml.example
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/

@@ -1,0 +1,25 @@
+[package]
+name = "mythd-inference"
+description = "mythd Layer 3 — inference orchestrator: model loading, kernel routing (BitNet INT2 auto-selected on Xe2), llama.cpp via a thin C ABI shim"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+build = "build.rs"
+
+# Layer 3 depends on Layers 1 and 2 only.
+[dependencies]
+mythd-core.workspace = true
+mythd-xpu.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[features]
+# OFF by default so the workspace builds without the llama.cpp/SYCL libraries.
+# When ON, `build.rs` links the mythd_llama shim + libllama + libggml (+ SYCL).
+# The BitNet INT2 kernel is reached through llama.cpp (Option A).
+llama-cpp = []
+
+[dev-dependencies]
+tracing-subscriber.workspace = true
