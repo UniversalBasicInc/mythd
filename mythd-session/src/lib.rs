@@ -241,9 +241,12 @@ pub use audit::{verify_chain, AuditLog, AuditOpenError, AuditRecord, AuditVerify
 /// The full secure inference path. Owns the orchestrator (Layer 3), the session
 /// manager, and the audit log — the complete MVP perimeter.
 pub struct SecureRuntime {
+    // Inference forwards over HTTP (`&self`), so the orchestrator needs no lock.
     orch: Orchestrator,
-    sessions: SessionManager,
-    audit: AuditLog,
+    // Brief locks only — never held across an inference forward. The audit chain
+    // is sequential, so its append is the one serialized step.
+    sessions: std::sync::Mutex<SessionManager>,
+    audit: std::sync::Mutex<AuditLog>,
 }
 
 /// Result of a [`SecureRuntime::infer`] call: the generated text plus the proof
@@ -263,6 +266,20 @@ pub struct SecureResponse {
     pub audit_record_json: Vec<u8>,
 }
 
+/// An owned, presentation-ready view of one signed audit entry (the live log is
+/// lock-guarded, so reads hand back owned copies rather than borrows).
+#[derive(Debug, Clone)]
+pub struct AuditEntryView {
+    pub seq: u64,
+    pub timestamp_ms: u64,
+    pub kernel: String,
+    pub prompt_tokens: u32,
+    pub generated_tokens: u32,
+    pub prev_hash: String,
+    pub signature: Vec<u8>,
+    pub record_json: Vec<u8>,
+}
+
 impl SecureRuntime {
     /// Build a runtime with a fresh (ephemeral) audit signing key. Fine for tests
     /// and the standalone demo; in production prefer
@@ -278,8 +295,8 @@ impl SecureRuntime {
     pub fn with_audit_signer(signer: mythd_core::AuditSigner) -> Self {
         Self {
             orch: Orchestrator::new(),
-            sessions: SessionManager::new(),
-            audit: AuditLog::new(signer),
+            sessions: std::sync::Mutex::new(SessionManager::new()),
+            audit: std::sync::Mutex::new(AuditLog::new(signer)),
         }
     }
 
@@ -293,20 +310,15 @@ impl SecureRuntime {
     ) -> std::result::Result<Self, AuditOpenError> {
         Ok(Self {
             orch: Orchestrator::new(),
-            sessions: SessionManager::new(),
-            audit: AuditLog::open(signer, log_path)?,
+            sessions: std::sync::Mutex::new(SessionManager::new()),
+            audit: std::sync::Mutex::new(AuditLog::open(signer, log_path)?),
         })
     }
 
-    /// Load the model into the orchestrator (Layer 3), optionally with a vision
-    /// projector (`mmproj`) so it accepts images.
-    pub fn load_model(
-        &mut self,
-        path: impl AsRef<std::path::Path>,
-        mmproj: Option<impl AsRef<std::path::Path>>,
-        weight_precision: Precision,
-    ) -> Result<()> {
-        self.orch.load_model(path, mmproj, weight_precision)?;
+    /// Point the runtime's orchestrator at a llama-server instance (loopback HTTP).
+    /// `vision` declares whether that server has a multimodal projector loaded.
+    pub fn connect_gateway(&mut self, url: &str, vision: bool) -> Result<()> {
+        self.orch.connect_gateway(url, vision)?;
         Ok(())
     }
 
@@ -337,12 +349,37 @@ impl SecureRuntime {
 
     /// The audit log's public verifying key (publishable; used to verify the log).
     pub fn audit_verifying_key(&self) -> Vec<u8> {
-        self.audit.verifying_key()
+        self.audit.lock().unwrap().verifying_key()
     }
 
-    /// The full signed, chained audit log.
-    pub fn audit_entries(&self) -> &[SignedEntry] {
-        self.audit.entries()
+    /// Number of audit entries recorded (brief lock).
+    pub fn audit_entry_count(&self) -> usize {
+        self.audit.lock().unwrap().len()
+    }
+
+    /// Owned, filtered view of the signed audit entries for one session — for the
+    /// API's `/v1/audit/{id}` endpoint. The live log is lock-guarded, so this hands
+    /// back owned copies rather than a borrow.
+    pub fn audit_records_for(&self, session_id: &str) -> Vec<AuditEntryView> {
+        let audit = self.audit.lock().unwrap();
+        let mut out = Vec::new();
+        for e in audit.entries() {
+            if let Ok(rec) = serde_json::from_slice::<AuditRecord>(&e.record_json) {
+                if rec.session_id == session_id {
+                    out.push(AuditEntryView {
+                        seq: rec.seq,
+                        timestamp_ms: rec.timestamp_ms,
+                        kernel: rec.kernel,
+                        prompt_tokens: rec.prompt_tokens,
+                        generated_tokens: rec.generated_tokens,
+                        prev_hash: rec.prev_hash,
+                        signature: e.signature.clone(),
+                        record_json: e.record_json.clone(),
+                    });
+                }
+            }
+        }
+        out
     }
 
     /// Detected XPU capabilities (for `/health`); `None` on a non-Intel host.
@@ -353,7 +390,7 @@ impl SecureRuntime {
     /// Run one inference through the complete perimeter, minting a fresh random
     /// session id: open session → infer → append signed audit entry → close.
     pub fn infer(
-        &mut self,
+        &self,
         req: &InferenceRequest,
         caps: Capabilities,
     ) -> Result<SecureResponse> {
@@ -364,60 +401,35 @@ impl SecureRuntime {
     /// caller-supplied session id when given — e.g. one established by the ML-KEM
     /// handshake at Layer 5. `None` mints a fresh random id.
     pub fn infer_with_session(
-        &mut self,
+        &self,
         session_id: Option<SessionId>,
         req: &InferenceRequest,
         caps: Capabilities,
     ) -> Result<SecureResponse> {
-        // 1. open a session (supplied id, or a fresh random one)
-        let sid = match session_id {
-            Some(id) => self.sessions.create_with_id(id, caps),
-            None => self.sessions.create(caps),
-        };
-
-        // 2. run inference under this session's exclusive borrow
-        let run = {
-            let session = self.sessions.get_mut(&sid).expect("just created");
-            session.infer(&mut self.orch, req)
-        };
-        let response = match run {
-            Ok(r) => r,
-            Err(e) => {
-                self.sessions.close(&sid); // still close cleanly on failure
-                return Err(e);
+        // Deny-by-default capability checks (formerly inside Session::infer).
+        if !caps.may_infer {
+            return Err(SessionError::Denied("inference not permitted"));
+        }
+        if req.max_new_tokens > caps.max_new_tokens {
+            return Err(SessionError::Denied("token budget exceeded"));
+        }
+        // Open a session (supplied id, or a fresh random one). Brief lock.
+        let sid = {
+            let mut s = self.sessions.lock().unwrap();
+            match session_id {
+                Some(id) => s.create_with_id(id, caps),
+                None => s.create(caps),
             }
         };
-
-        // 3. append a signed, chained audit entry
-        let kernel = response.backend.clone();
-        let seq = self.audit.append(
-            &sid,
-            now_unix_ms(),
-            &kernel,
-            response.prompt_tokens,
-            response.generated_tokens,
-        );
-        let entry = self.audit.entries().last().expect("just appended");
-        let out = SecureResponse {
-            session_id: sid.0.clone(),
-            text: response.text.clone(),
-            prompt_tokens: response.prompt_tokens,
-            generated_tokens: response.generated_tokens,
-            kernel,
-            audit_seq: seq,
-            audit_signature_hex: hex(&entry.signature),
-            audit_record_json: entry.record_json.clone(),
+        // Inference forwards over HTTP holding NO lock → concurrent across requests.
+        let response = match self.orch.infer(req) {
+            Ok(r) => r,
+            Err(e) => {
+                self.sessions.lock().unwrap().close(&sid);
+                return Err(e.into());
+            }
         };
-
-        // 4. close the session cleanly (drops the Session + its KvCache)
-        self.sessions.close(&sid);
-        tracing::info!(
-            target: "mythd::session",
-            session = %out.session_id, seq = out.audit_seq, kernel = %out.kernel,
-            prompt_tokens = out.prompt_tokens, generated_tokens = out.generated_tokens,
-            "inference recorded + signed"
-        );
-        Ok(out)
+        Ok(self.record_and_close(sid, response))
     }
 
     /// Streaming variant of [`Self::infer_with_session`]: each token is delivered
@@ -426,57 +438,71 @@ impl SecureRuntime {
     /// response — and the session is closed. The returned [`SecureResponse`]
     /// carries the same audit provenance as the non-streaming path.
     pub fn infer_stream(
-        &mut self,
+        &self,
         session_id: Option<SessionId>,
         req: &InferenceRequest,
         caps: Capabilities,
         on_token: impl FnMut(&str) -> bool,
     ) -> Result<SecureResponse> {
-        let sid = match session_id {
-            Some(id) => self.sessions.create_with_id(id, caps),
-            None => self.sessions.create(caps),
-        };
-
-        let run = {
-            let session = self.sessions.get_mut(&sid).expect("just created");
-            session.infer_stream(&mut self.orch, req, on_token)
-        };
-        let response = match run {
-            Ok(r) => r,
-            Err(e) => {
-                self.sessions.close(&sid);
-                return Err(e);
+        if !caps.may_infer {
+            return Err(SessionError::Denied("inference not permitted"));
+        }
+        if req.max_new_tokens > caps.max_new_tokens {
+            return Err(SessionError::Denied("token budget exceeded"));
+        }
+        let sid = {
+            let mut s = self.sessions.lock().unwrap();
+            match session_id {
+                Some(id) => s.create_with_id(id, caps),
+                None => s.create(caps),
             }
         };
+        // Streaming forward holds NO session/audit lock → concurrent.
+        let response = match self.orch.infer_stream(req, on_token) {
+            Ok(r) => r,
+            Err(e) => {
+                self.sessions.lock().unwrap().close(&sid);
+                return Err(e.into());
+            }
+        };
+        Ok(self.record_and_close(sid, response))
+    }
 
+    /// Append a signed, chained audit entry for `response`, then close the session.
+    /// The audit append is the only serialized step (the chain is sequential); it
+    /// is never held across an inference forward.
+    fn record_and_close(&self, sid: SessionId, response: InferenceResponse) -> SecureResponse {
         let kernel = response.backend.clone();
-        let seq = self.audit.append(
-            &sid,
-            now_unix_ms(),
-            &kernel,
-            response.prompt_tokens,
-            response.generated_tokens,
+        let session_id = sid.0.clone();
+        let (seq, sig_hex, record_json) = {
+            let mut a = self.audit.lock().unwrap();
+            let seq = a.append(
+                &sid,
+                now_unix_ms(),
+                &kernel,
+                response.prompt_tokens,
+                response.generated_tokens,
+            );
+            let entry = a.entries().last().expect("just appended");
+            (seq, hex(&entry.signature), entry.record_json.clone())
+        };
+        self.sessions.lock().unwrap().close(&sid);
+        tracing::info!(
+            target: "mythd::session",
+            session = %session_id, seq, kernel = %kernel,
+            prompt_tokens = response.prompt_tokens, generated_tokens = response.generated_tokens,
+            "inference recorded + signed"
         );
-        let entry = self.audit.entries().last().expect("just appended");
-        let out = SecureResponse {
-            session_id: sid.0.clone(),
-            text: response.text.clone(),
+        SecureResponse {
+            session_id,
+            text: response.text,
             prompt_tokens: response.prompt_tokens,
             generated_tokens: response.generated_tokens,
             kernel,
             audit_seq: seq,
-            audit_signature_hex: hex(&entry.signature),
-            audit_record_json: entry.record_json.clone(),
-        };
-
-        self.sessions.close(&sid);
-        tracing::info!(
-            target: "mythd::session",
-            session = %out.session_id, seq = out.audit_seq, kernel = %out.kernel,
-            prompt_tokens = out.prompt_tokens, generated_tokens = out.generated_tokens,
-            "streamed inference recorded + signed"
-        );
-        Ok(out)
+            audit_signature_hex: sig_hex,
+            audit_record_json: record_json,
+        }
     }
 }
 

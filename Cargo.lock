@@ -1109,6 +1109,8 @@ version = "0.1.0"
 dependencies = [
  "mythd-core",
  "mythd-xpu",
+ "reqwest",
+ "serde_json",
  "thiserror",
  "tracing",
  "tracing-subscriber",

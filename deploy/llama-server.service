@@ -1,0 +1,18 @@
+[Unit]
+Description=llama-server (batched inference engine behind mythd)
+After=network-online.target
+Wants=network-online.target
+# mythd proxies to this; bring the engine up first so mythd's /health can pass.
+Before=mythd.service
+
+[Service]
+Type=simple
+User=mythd
+ExecStart=/opt/mythd/run-llama-server.sh
+Restart=always
+RestartSec=3
+# the 18GB model + KV pool take time to load before the port is ready
+TimeoutStartSec=180
+
+[Install]
+WantedBy=multi-user.target

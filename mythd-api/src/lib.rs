@@ -35,14 +35,14 @@ use serde::{Deserialize, Serialize};
 
 use mythd_core::SessionKey;
 use mythd_inference::{InferenceRequest, Sampling};
-use mythd_session::{AuditRecord, Capabilities, SecureRuntime, SessionId};
+use mythd_session::{Capabilities, SecureRuntime, SessionId};
 
 pub mod openai {
     //! Minimal OpenAI-compatible request types (responses are built with
     //! `serde_json` so the wire shape exactly matches what clients expect).
     use super::{Deserialize, Serialize};
 
-    #[derive(Debug, Deserialize)]
+    #[derive(Debug, Serialize, Deserialize)]
     pub struct ChatMessage {
         pub role: String,
         pub content: Content,
@@ -50,14 +50,14 @@ pub mod openai {
 
     /// OpenAI message content: either a plain string, or an array of parts (the
     /// vision format, where parts can be text or an image).
-    #[derive(Debug, Deserialize)]
+    #[derive(Debug, Serialize, Deserialize)]
     #[serde(untagged)]
     pub enum Content {
         Text(String),
         Parts(Vec<ContentPart>),
     }
 
-    #[derive(Debug, Deserialize)]
+    #[derive(Debug, Serialize, Deserialize)]
     #[serde(tag = "type")]
     pub enum ContentPart {
         #[serde(rename = "text")]
@@ -66,7 +66,7 @@ pub mod openai {
         ImageUrl { image_url: ImageUrl },
     }
 
-    #[derive(Debug, Deserialize)]
+    #[derive(Debug, Serialize, Deserialize)]
     pub struct ImageUrl {
         pub url: String,
     }
@@ -148,7 +148,10 @@ pub struct DeviceInfo {
 }
 
 struct AppInner {
-    runtime: tokio::sync::Mutex<SecureRuntime>,
+    // No outer lock: SecureRuntime is Send+Sync and its inference path is &self,
+    // so requests forward concurrently (bounded by `infer_sem`). The brief
+    // sessions/audit locks live inside SecureRuntime, never held across a forward.
+    runtime: SecureRuntime,
     sessions: tokio::sync::Mutex<HashMap<String, TransportSession>>,
     model_id: String,
     max_sessions: usize,
@@ -160,9 +163,9 @@ struct AppInner {
     /// Audit log's public verifying key, cached at startup (stable for the life of
     /// the process), so session handshakes don't contend the inference lock.
     audit_verifying_key: Vec<u8>,
-    /// Admission control: caps total in-flight + queued inference so the server
-    /// sheds load (503) instead of piling up. Inference itself is serial (one
-    /// llama context) — this bounds the queue, it does not parallelize inference.
+    /// Admission control: caps total concurrent inference so the server sheds load
+    /// (503) instead of piling up. Inference now runs concurrently — each request
+    /// forwards to a llama-server batch slot — so this bounds how many at once.
     infer_sem: Arc<tokio::sync::Semaphore>,
     /// True when the loaded model accepts images (a vision mmproj is loaded).
     vision: bool,
@@ -213,7 +216,7 @@ impl AppState {
         let infer_sem = Arc::new(tokio::sync::Semaphore::new(max_inflight.max(1)));
         Self {
             inner: Arc::new(AppInner {
-                runtime: tokio::sync::Mutex::new(runtime),
+                runtime,
                 sessions: tokio::sync::Mutex::new(HashMap::new()),
                 model_id: model_id.into(),
                 max_sessions,
@@ -478,15 +481,15 @@ async fn chat_completions(
         None => Capabilities::allow_infer(max_tokens),
     };
 
-    let (prompt, image) = build_prompt_and_image(&req.messages);
-    if image.is_some() && !st.inner.vision {
+    let (messages, has_image) = prepare_messages(&req.messages)?;
+    if has_image && !st.inner.vision {
         return Err(ApiError::bad_request("this model has no vision support (no mmproj loaded)"));
     }
     let inf_req = InferenceRequest {
-        prompt,
+        messages,
         max_new_tokens: max_tokens,
         sampling: sampling_from(req.temperature, req.top_p, req.seed),
-        image,
+        has_image,
     };
 
     // Admission control: cap total in-flight + queued inference (backpressure →
@@ -513,13 +516,15 @@ async fn chat_completions(
         return Ok(stream_response(st.clone(), session_id, inf_req, caps, model, permit));
     }
 
-    // Non-streaming: inference is serial (one llama context); the call is blocking,
-    // so `block_in_place` keeps it off the async reactor.
-    let result = {
-        let mut rt = st.inner.runtime.lock().await;
-        tokio::task::block_in_place(|| rt.infer_with_session(session_id.clone(), &inf_req, caps))
-    };
-    let resp = result?;
+    // Non-streaming: the forward to llama-server is blocking, so run it on a
+    // blocking thread (no shared lock) → many forwards run concurrently.
+    let st2 = st.clone();
+    let resp = tokio::task::spawn_blocking(move || {
+        let _permit = permit; // held for the duration of the forward
+        st2.inner.runtime.infer_with_session(session_id, &inf_req, caps)
+    })
+    .await
+    .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "server_error", "inference task failed"))??;
     Ok(Json(json_completion(&resp, &model)).into_response())
 }
 
@@ -552,8 +557,7 @@ fn stream_response(
         // opening role delta
         let _ = tx.blocking_send(Ok(stream_chunk(&id, created, &model, serde_json::json!({ "role": "assistant" }), None)));
 
-        let mut rt = st.inner.runtime.blocking_lock();
-        let res = rt.infer_stream(Some(sid.clone()), &inf_req, caps, |piece| {
+        let res = st.inner.runtime.infer_stream(Some(sid.clone()), &inf_req, caps, |piece| {
             // `blocking_send` errors when the receiver is gone (client
             // disconnected) → returning false stops generation, freeing the
             // inference slot + permit instead of decoding into the void.
@@ -629,33 +633,35 @@ async fn secure_chat(
         .unwrap_or(st.inner.default_max_tokens)
         .min(st.inner.max_tokens_cap)
         .max(1);
-    let (prompt, image) = build_prompt_and_image(&chat.messages);
-    if image.is_some() && !st.inner.vision {
+    let (messages, has_image) = prepare_messages(&chat.messages)?;
+    if has_image && !st.inner.vision {
         return Err(ApiError::bad_request("this model has no vision support (no mmproj loaded)"));
     }
     let inf_req = InferenceRequest {
-        prompt,
+        messages,
         max_new_tokens: max_tokens,
         sampling: sampling_from(chat.temperature, chat.top_p, chat.seed),
-        image,
+        has_image,
     };
 
     // admission control (same backpressure as the plaintext path)
-    let _permit = st.inner.infer_sem.clone().try_acquire_owned().map_err(|_| {
+    let permit = st.inner.infer_sem.clone().try_acquire_owned().map_err(|_| {
         ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "server_busy",
             "inference queue full, retry shortly",
         )
     })?;
-    // 3. run inference, bound to (and audited under) this session.
-    let result = {
-        let mut rt = st.inner.runtime.lock().await;
-        tokio::task::block_in_place(|| {
-            rt.infer_with_session(Some(SessionId(req.session_id.clone())), &inf_req, caps)
-        })
-    };
-    let resp = result?;
+    // 3. run inference, bound to (and audited under) this session. Blocking forward
+    // on a blocking thread → concurrent with other requests.
+    let st2 = st.clone();
+    let sid2 = req.session_id.clone();
+    let resp = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        st2.inner.runtime.infer_with_session(Some(SessionId(sid2)), &inf_req, caps)
+    })
+    .await
+    .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "server_error", "inference task failed"))??;
 
     let model = if chat.model.is_empty() {
         st.inner.model_id.clone()
@@ -686,28 +692,27 @@ async fn audit(
     Path(session_id): Path<String>,
 ) -> std::result::Result<Json<serde_json::Value>, ApiError> {
     st.authorize(&headers)?;
-    let rt = st.inner.runtime.lock().await;
-    let vk = rt.audit_verifying_key();
+    let vk = st.inner.audit_verifying_key.clone(); // cached at startup (stable key)
+
+    // The audit log is lock-guarded; read it on a blocking thread (owned copies).
+    let st2 = st.clone();
+    let sid = session_id.clone();
+    let records = tokio::task::spawn_blocking(move || st2.inner.runtime.audit_records_for(&sid))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "server_error", "audit read failed"))?;
 
     let mut entries = Vec::new();
-    for e in rt.audit_entries() {
-        let rec: AuditRecord = match serde_json::from_slice(&e.record_json) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        if rec.session_id != session_id {
-            continue;
-        }
+    for r in records {
         entries.push(serde_json::json!({
-            "seq": rec.seq,
-            "timestamp_ms": rec.timestamp_ms,
-            "kernel": rec.kernel,
-            "prompt_tokens": rec.prompt_tokens,
-            "generated_tokens": rec.generated_tokens,
-            "prev_hash": rec.prev_hash,
-            "signature": to_hex(&e.signature),
+            "seq": r.seq,
+            "timestamp_ms": r.timestamp_ms,
+            "kernel": r.kernel,
+            "prompt_tokens": r.prompt_tokens,
+            "generated_tokens": r.generated_tokens,
+            "prev_hash": r.prev_hash,
+            "signature": to_hex(&r.signature),
             // exact signed bytes (base64) so the client can re-verify the signature
-            "record_b64": b64_encode(&e.record_json),
+            "record_b64": b64_encode(&r.record_json),
         }));
     }
 
@@ -791,68 +796,37 @@ fn sampling_from(temperature: Option<f32>, top_p: Option<f32>, seed: Option<i64>
     }
 }
 
-/// Render the chat into a prompt using **ChatML** (`<|im_start|>role … <|im_end|>`),
-/// the template Qwen3 (and Qwen2.5, and many others) expect. This matters for more
-/// than formatting: the model emits `<|im_end|>` (an EOG/stop token) only when it
-/// sees ChatML, so the generation terminates at the end of its turn instead of
-/// rambling into a hallucinated next turn. The shim tokenizes with
-/// `parse_special=true`, so these markers become the real special tokens.
+/// Validate + prepare the chat messages for forwarding to llama-server.
 ///
-/// NOTE: ChatML covers Qwen/Yi/many models; a model with a different native
-/// template (Llama-3, Gemma, …) would want its own. The general fix is to apply
-/// the GGUF's embedded template via `llama_chat_apply_template` in the engine —
-/// tracked as a follow-up; ChatML is correct for the current (Qwen3) deployment.
-/// Build the ChatML prompt and extract an image (if any). Returns the prompt
-/// (with a `<__media__>` marker where the image belongs) plus the decoded image
-/// bytes. Only the FIRST image is used (the shim takes one), and only inline
-/// `data:` URLs are accepted — mythd does not fetch remote URLs (privacy/SSRF).
-fn build_prompt_and_image(messages: &[openai::ChatMessage]) -> (String, Option<Vec<u8>>) {
+/// The OpenAI `messages` array is forwarded **verbatim**, so llama-server applies
+/// the model's own chat template (`--jinja`) and handles vision via `mtmd` — which
+/// retires mythd's hand-rolled ChatML and gets the correct Qwen3-VL template for
+/// free. Two rules are enforced here: (1) only inline `data:` image URLs are
+/// allowed — mythd never fetches remote URLs (privacy/SSRF); (2) report whether an
+/// image is present so the caller can gate on the model's vision capability.
+fn prepare_messages(
+    messages: &[openai::ChatMessage],
+) -> std::result::Result<(serde_json::Value, bool), ApiError> {
     use openai::{Content, ContentPart};
-    let mut p = String::new();
-    let mut image: Option<Vec<u8>> = None;
+    let mut has_image = false;
     for m in messages {
-        p.push_str("<|im_start|>");
-        p.push_str(&m.role);
-        p.push('\n');
-        match &m.content {
-            Content::Text(t) => p.push_str(t),
-            Content::Parts(parts) => {
-                for part in parts {
-                    match part {
-                        ContentPart::Text { text } => p.push_str(text),
-                        ContentPart::ImageUrl { image_url } => {
-                            // Keep only the first decodable inline image; emit one
-                            // marker per bitmap so mtmd's marker/bitmap counts match.
-                            if image.is_none() {
-                                if let Some(bytes) = decode_data_url(&image_url.url) {
-                                    image = Some(bytes);
-                                    p.push_str("<__media__>");
-                                }
-                            }
-                        }
+        if let Content::Parts(parts) = &m.content {
+            for part in parts {
+                if let ContentPart::ImageUrl { image_url } = part {
+                    if !image_url.url.starts_with("data:") {
+                        return Err(ApiError::bad_request(
+                            "only inline data: image URLs are accepted (mythd does not fetch remote URLs)",
+                        ));
                     }
+                    has_image = true;
                 }
             }
         }
-        p.push_str("<|im_end|>\n");
     }
-    p.push_str("<|im_start|>assistant\n");
-    (p, image)
-}
-
-/// Decode an inline `data:[mime];base64,<...>` URL to bytes. Returns None for
-/// non-data (remote) URLs or malformed input — mythd never fetches remote URLs.
-fn decode_data_url(url: &str) -> Option<Vec<u8>> {
-    if !url.starts_with("data:") {
-        return None;
-    }
-    let comma = url.find(',')?;
-    let header = &url[..comma];
-    let payload = &url[comma + 1..];
-    if !header.contains(";base64") {
-        return None;
-    }
-    b64_decode(payload).ok()
+    let value = serde_json::to_value(messages).map_err(|_| {
+        ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "server_error", "encode failed")
+    })?;
+    Ok((value, has_image))
 }
 
 /// Key-confirmation tag: SHA-256(session_key ‖ session_id ‖ label). Both sides
@@ -917,38 +891,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prompt_builds_in_order() {
+    fn messages_forward_in_order_no_image() {
         use openai::Content;
         let msgs = vec![
             openai::ChatMessage { role: "system".into(), content: Content::Text("Be terse.".into()) },
             openai::ChatMessage { role: "user".into(), content: Content::Text("Hi".into()) },
         ];
-        let (p, image) = build_prompt_and_image(&msgs);
-        // ChatML, in order, ending with the open assistant turn; no image.
-        assert!(p.starts_with("<|im_start|>system\nBe terse.<|im_end|>\n"));
-        assert!(p.contains("<|im_start|>user\nHi<|im_end|>\n"));
-        assert!(p.ends_with("<|im_start|>assistant\n"));
-        assert!(image.is_none());
+        let (value, has_image) = prepare_messages(&msgs).unwrap();
+        assert!(!has_image);
+        let arr = value.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["role"], "system");
+        assert_eq!(arr[0]["content"], "Be terse.");
+        assert_eq!(arr[1]["content"], "Hi");
     }
 
     #[test]
-    fn vision_content_extracts_image_and_marker() {
+    fn inline_image_ok_remote_rejected() {
         use openai::{Content, ContentPart, ImageUrl};
-        // 1x1 PNG (red), base64.
-        let png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
-        let msgs = vec![openai::ChatMessage {
+        let png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+        let ok = vec![openai::ChatMessage {
             role: "user".into(),
             content: Content::Parts(vec![
                 ContentPart::Text { text: "what is this?".into() },
-                ContentPart::ImageUrl { image_url: ImageUrl { url: format!("data:image/png;base64,{png_b64}") } },
+                ContentPart::ImageUrl { image_url: ImageUrl { url: png.into() } },
             ]),
         }];
-        let (p, image) = build_prompt_and_image(&msgs);
-        assert!(p.contains("<__media__>"), "marker inserted for the image");
-        assert!(p.contains("what is this?"));
-        assert!(image.is_some(), "inline data URL decoded to bytes");
-        // a remote URL must NOT be fetched
-        assert!(decode_data_url("https://example.com/x.png").is_none());
+        let (value, has_image) = prepare_messages(&ok).unwrap();
+        assert!(has_image);
+        let parts = value[0]["content"].as_array().unwrap();
+        assert_eq!(parts[1]["type"], "image_url");
+        assert!(parts[1]["image_url"]["url"].as_str().unwrap().starts_with("data:"));
+
+        // a remote URL must be rejected (no SSRF / no remote fetch)
+        let remote = vec![openai::ChatMessage {
+            role: "user".into(),
+            content: Content::Parts(vec![ContentPart::ImageUrl {
+                image_url: ImageUrl { url: "https://example.com/x.png".into() },
+            }]),
+        }];
+        assert!(prepare_messages(&remote).is_err());
     }
 
     #[test]

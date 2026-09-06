@@ -14,6 +14,10 @@ mythd-core.workspace = true
 mythd-xpu.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+serde_json.workspace = true
+# Gateway client to a local llama-server (loopback HTTP, no TLS needed). Blocking
+# client; the API layer always calls it from spawn_blocking, never the reactor.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json"] }
 
 [features]
 # OFF by default so the workspace builds without the llama.cpp/SYCL libraries.

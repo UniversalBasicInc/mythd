@@ -54,16 +54,16 @@ impl Default for Sampling {
     }
 }
 
-/// One generation request: text (and optionally an image) in, text out, plus how
-/// to sample. When `image` is set, `prompt` must contain the `<__media__>` marker
-/// where the image belongs, and the model must have been loaded with a vision
-/// projector (mmproj).
+/// One generation request. `messages` is an OpenAI chat `messages` array (text +
+/// optional inline-`data:` image_url parts), forwarded verbatim to the engine,
+/// which applies the model's chat template and handles vision. `has_image` records
+/// whether an image is present (for the vision-capability gate + the audit).
 #[derive(Debug, Clone)]
 pub struct InferenceRequest {
-    pub prompt: String,
+    pub messages: serde_json::Value,
     pub max_new_tokens: u32,
     pub sampling: Sampling,
-    pub image: Option<Vec<u8>>,
+    pub has_image: bool,
 }
 
 /// Raw engine output: text plus token counts.
@@ -88,20 +88,30 @@ pub struct InferenceResponse {
     pub backend: String,
 }
 
+pub mod gateway;
+pub use gateway::LlamaServerClient;
+
+// The embedded llama.cpp FFI engine is retained behind the `llama-cpp` feature
+// (the standalone / Intel-demo path). The production daemon uses the gateway.
+#[cfg(feature = "llama-cpp")]
 pub mod engine;
+#[cfg(feature = "llama-cpp")]
 pub use engine::LlamaEngine;
 
-/// The orchestrator owns the engine + detected device caps and routes work.
+/// The orchestrator holds the gateway client to llama-server + detected device
+/// caps. Inference forwards over HTTP, so the hot path is `&self` (shared) — many
+/// requests run concurrently as llama-server batch slots.
 pub struct Orchestrator {
-    engine: Option<LlamaEngine>,
+    client: Option<gateway::LlamaServerClient>,
     caps: Option<mythd_xpu::DeviceCaps>,
-    /// Weight precision of the loaded model (drives kernel selection / logging).
+    /// Weight precision recorded for the kernel-capability hint / logging.
     weight_precision: Precision,
-    n_gpu_layers: i32,
+    /// Configured context window (tokens) — informational; the live KV pool is
+    /// owned by llama-server. Kept for /health + logging.
     n_ctx: i32,
-    /// Store the KV cache as q8_0 (INT8) instead of f16 — ~half KV memory/bandwidth.
+    /// Whether the KV cache is q8_0 (INT8) — informational (set on llama-server).
     kv_q8: bool,
-    /// True when the loaded model has a vision projector (accepts images).
+    /// True when the engine accepts images (a vision mmproj is loaded server-side).
     vision: bool,
 }
 
@@ -113,30 +123,21 @@ impl Orchestrator {
             None => tracing::warn!(target: "mythd::infer", "no XPU detected — host fallback path"),
         }
         Self {
-            engine: None,
+            client: None,
             caps,
             weight_precision: Precision::Int2, // BitNet reference default
-            n_gpu_layers: 999,                 // offload all layers when a GPU is present
-            n_ctx: 4096,
+            n_ctx: 8192,
             kv_q8: false,
             vision: false,
         }
     }
 
-    /// Load a model (GGUF) through llama.cpp, optionally with a vision projector
-    /// (`mmproj`) so it accepts images. `weight_precision` is recorded for logging.
-    pub fn load_model(
-        &mut self,
-        path: impl AsRef<std::path::Path>,
-        mmproj: Option<impl AsRef<std::path::Path>>,
-        weight_precision: Precision,
-    ) -> Result<()> {
-        let mut eng = LlamaEngine::new()?;
-        let mmproj_ref = mmproj.as_ref().map(|p| p.as_ref());
-        eng.load(path.as_ref(), mmproj_ref, self.n_gpu_layers, self.n_ctx, self.kv_q8)?;
-        self.engine = Some(eng);
-        self.weight_precision = weight_precision;
-        self.vision = mmproj_ref.is_some();
+    /// Point the orchestrator at a llama-server instance (loopback HTTP). `vision`
+    /// declares whether that server has a multimodal projector loaded. No network
+    /// call is made here; reachability is exercised on the first request.
+    pub fn connect_gateway(&mut self, url: &str, vision: bool) -> Result<()> {
+        self.client = Some(gateway::LlamaServerClient::new(url)?);
+        self.vision = vision;
         Ok(())
     }
 
@@ -187,17 +188,18 @@ impl Orchestrator {
     /// SYCL backend handles offloaded layers, otherwise CPU.
     pub fn backend_label(&self) -> String {
         match self.caps.as_ref() {
-            Some(c) => format!("llama.cpp/sycl ({})", c.name),
-            None => "llama.cpp/cpu".to_string(),
+            Some(c) => format!("llama.cpp/sycl via llama-server ({})", c.name),
+            None => "llama.cpp via llama-server".to_string(),
         }
     }
 
-    /// Run one generation.
-    pub fn infer(&mut self, req: &InferenceRequest) -> Result<InferenceResponse> {
+    /// Run one generation by forwarding to llama-server. `&self` so many requests
+    /// forward concurrently (no exclusive engine lock).
+    pub fn infer(&self, req: &InferenceRequest) -> Result<InferenceResponse> {
         let backend = self.backend_label();
-        let engine = self.engine.as_mut().ok_or(InferenceError::NoModel)?;
-        tracing::info!(target: "mythd::infer", %backend, max = req.max_new_tokens, temp = req.sampling.temperature, image = req.image.is_some(), "generate");
-        let gen = engine.generate(&req.prompt, req.max_new_tokens as i32, req.sampling, req.image.as_deref())?;
+        let client = self.client.as_ref().ok_or(InferenceError::NoModel)?;
+        tracing::info!(target: "mythd::infer", %backend, max = req.max_new_tokens, temp = req.sampling.temperature, image = req.has_image, "generate");
+        let gen = client.infer(req)?;
         Ok(InferenceResponse {
             text: gen.text,
             prompt_tokens: gen.prompt_tokens,
@@ -207,31 +209,21 @@ impl Orchestrator {
     }
 
     /// Run one generation, invoking `on_token` with each token's text as it is
-    /// produced (true incremental streaming), and returning the assembled
-    /// response. `on_token` returns `false` to stop early (e.g. the client
-    /// disconnected) — generation halts and the partial response is returned.
-    /// `on_token` is called on the calling thread between decode steps.
+    /// produced (true incremental streaming). `on_token` returns `false` to stop
+    /// early (e.g. the client disconnected). `&self` for concurrent forwards.
     pub fn infer_stream(
-        &mut self,
+        &self,
         req: &InferenceRequest,
-        mut on_token: impl FnMut(&str) -> bool,
+        on_token: impl FnMut(&str) -> bool,
     ) -> Result<InferenceResponse> {
         let backend = self.backend_label();
-        let engine = self.engine.as_mut().ok_or(InferenceError::NoModel)?;
-        tracing::info!(target: "mythd::infer", %backend, max = req.max_new_tokens, temp = req.sampling.temperature, image = req.image.is_some(), "stream");
-        let prompt_tokens = engine.stream_begin(&req.prompt, req.max_new_tokens as i32, req.sampling, req.image.as_deref())?;
-        let mut text = String::new();
-        while let Some(piece) = engine.stream_next()? {
-            text.push_str(&piece);
-            if !on_token(&piece) {
-                tracing::debug!(target: "mythd::infer", "stream consumer cancelled — stopping generation");
-                break;
-            }
-        }
+        let client = self.client.as_ref().ok_or(InferenceError::NoModel)?;
+        tracing::info!(target: "mythd::infer", %backend, max = req.max_new_tokens, temp = req.sampling.temperature, image = req.has_image, "stream");
+        let gen = client.infer_stream(req, on_token)?;
         Ok(InferenceResponse {
-            text,
-            prompt_tokens,
-            generated_tokens: engine.stream_gen_count(),
+            text: gen.text,
+            prompt_tokens: gen.prompt_tokens,
+            generated_tokens: gen.generated_tokens,
             backend,
         })
     }

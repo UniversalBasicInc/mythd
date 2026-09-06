@@ -63,6 +63,15 @@ struct Config {
     /// (backpressure). Inference is serial regardless; this bounds the queue.
     #[serde(default = "default_max_inflight")]
     max_inflight: usize,
+    /// URL of the local llama-server the gateway forwards to (loopback). The engine
+    /// — model weights, per-slot KV cache, continuous batching — runs there; mythd
+    /// is the secure front door (PQC handshake, auth, signed audit).
+    #[serde(default = "default_llama_server_url")]
+    llama_server_url: String,
+    /// Whether the llama-server has a vision projector (mmproj) loaded, so this
+    /// gateway should accept images.
+    #[serde(default = "default_vision")]
+    vision: bool,
 }
 
 fn default_bind() -> String {
@@ -91,6 +100,12 @@ fn default_audit_key_path() -> String {
 fn default_max_inflight() -> usize {
     16
 }
+fn default_llama_server_url() -> String {
+    "http://127.0.0.1:8091".to_string()
+}
+fn default_vision() -> bool {
+    true
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -109,6 +124,8 @@ impl Default for Config {
             audit_log_path: None,
             api_keys: Vec::new(),
             max_inflight: default_max_inflight(),
+            llama_server_url: default_llama_server_url(),
+            vision: default_vision(),
         }
     }
 }
@@ -137,7 +154,7 @@ async fn main() -> Result<()> {
         Some(p) => {
             let rt = mythd_session::SecureRuntime::with_persistent_audit(signer, std::path::Path::new(p))
                 .with_context(|| format!("audit log: {p} (failed integrity verification or i/o)"))?;
-            tracing::info!(audit_log = %p, entries = rt.audit_entries().len(), "audit log opened + verified");
+            tracing::info!(audit_log = %p, entries = rt.audit_entry_count(), "audit log opened + verified");
             rt
         }
         None => {
@@ -159,22 +176,18 @@ async fn main() -> Result<()> {
     runtime.set_context_size(config.n_ctx);
     runtime.set_kv_q8(config.kv_cache_type.eq_ignore_ascii_case("q8_0"));
 
-    // Load the model if configured. Without the `llama-cpp` feature this returns
-    // "engine not built" — the daemon still serves /health and /v1/models.
-    if let Some(path) = &config.model_path {
-        match runtime.load_model(path, config.mmproj_path.as_ref(), mythd_inference::Precision::Int2) {
-            Ok(()) => tracing::info!(
-                model = %path,
-                vision = runtime.supports_vision(),
-                n_ctx = runtime.context_size(),
-                kv_q8 = runtime.kv_q8(),
-                mmproj = config.mmproj_path.as_deref().unwrap_or("(none)"),
-                "model loaded"
-            ),
-            Err(e) => tracing::warn!(error = %e, model = %path, "model load failed — inference disabled"),
-        }
-    } else {
-        tracing::warn!("no model_path configured — inference disabled");
+    // Connect the gateway to the local llama-server (the batched engine). mythd no
+    // longer loads the model itself — llama-server owns the weights + KV slots +
+    // continuous batching; mythd forwards over loopback and keeps the perimeter.
+    match runtime.connect_gateway(&config.llama_server_url, config.vision) {
+        Ok(()) => tracing::info!(
+            url = %config.llama_server_url,
+            vision = runtime.supports_vision(),
+            n_ctx = runtime.context_size(),
+            kv_q8 = runtime.kv_q8(),
+            "gateway connected to llama-server"
+        ),
+        Err(e) => tracing::warn!(error = %e, url = %config.llama_server_url, "gateway connect failed — inference disabled"),
     }
 
     // Layer 5: state + router.
