@@ -299,6 +299,7 @@ async fn health_static() -> &'static str {
 
 /// API error. Messages are intentionally coarse — no internal/infra detail on the
 /// wire; specifics are logged server-side.
+#[derive(Debug)]
 pub struct ApiError {
     status: StatusCode,
     code: &'static str,

@@ -7,11 +7,12 @@ Before=mythd.service
 
 [Service]
 Type=simple
+# Run as a dedicated unprivileged account; adjust the path to your llama.cpp checkout.
 User=mythd
 ExecStart=/opt/mythd/run-llama-server.sh
 Restart=always
 RestartSec=3
-# the 18GB model + KV pool take time to load before the port is ready
+# a large model + KV pool take time to load before the port is ready
 TimeoutStartSec=180
 
 [Install]

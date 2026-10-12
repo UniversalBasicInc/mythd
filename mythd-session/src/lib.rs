@@ -352,6 +352,12 @@ impl SecureRuntime {
         self.audit.lock().unwrap().verifying_key()
     }
 
+    /// Owned snapshot of every signed audit entry, in chain order — the input
+    /// [`verify_chain`] expects. The live log is lock-guarded, so this copies.
+    pub fn audit_entries(&self) -> Vec<SignedEntry> {
+        self.audit.lock().unwrap().entries().to_vec()
+    }
+
     /// Number of audit entries recorded (brief lock).
     pub fn audit_entry_count(&self) -> usize {
         self.audit.lock().unwrap().len()
